@@ -161,35 +161,30 @@ func (p *Predictor) retryCascade(x CongestionState) float64 {
 Capacity evolution with stochastic jitter
 */
 func (p *Predictor) capacityNext(x CongestionState) float64 {
-	// Tau represents physical Kubernetes spin-up/down inertia in seconds
 	tau := x.CapacityTauUp
 	if x.CapacityTarget < x.CapacityActive {
 		tau = x.CapacityTauDown
 	}
-	
-	// Prevent division by zero mathematically
-	if tau <= 0.1 { tau = 30.0 }
+	if tau <= 0.1 { tau = 30.0 } // Safe hardware default
 
-	// Differential Equation: dc/dt = (Target - Current) / Tau
 	rate := (x.CapacityTarget - x.CapacityActive) / tau
-	
 	return x.CapacityActive + (rate * p.Dt)
 }
-
 /*
 Latency dynamics with service recovery coupling
 */
 func (p *Predictor) latencyNext(x CongestionState) float64 {
 	activeConns := math.Max(1.0, x.CapacityActive)
-	serviceRate := math.Max(0.001, x.ServiceRate)
+	
+	// Jackson Network Theorem: Effective service rate drops under upstream pressure
+	effectiveService := math.Max(0.001, x.ServiceRate * (1.0 - x.UpstreamPressure))
 
-	// Physics: Base execution time + Queuing delay (L = lambda * W)
-	expectedBaseLat := 1.0 / serviceRate
-	expectedWaitLat := x.Backlog / (activeConns * serviceRate)
+	expectedBaseLat := 1.0 / effectiveService
+	expectedWaitLat := x.Backlog / (activeConns * effectiveService)
 	
 	targetLatency := expectedBaseLat + expectedWaitLat + x.NetworkJitter + x.CPUPressure
 
-	// Thermal inertia: Latency doesn't snap instantly, it propagates through network buffers.
+	// Network thermal inertia (Latency propagation delay)
 	inertiaTau := 5.0 
 	rate := (targetLatency - x.Latency) / inertiaTau
 
@@ -296,32 +291,27 @@ Single propagation
 func (p *Predictor) Step(x CongestionState) CongestionState {
 	next := x
 
-	m, v := p.updateArrivalStats(x, p.arrival(x))
-	next.ArrivalMean = m
-	next.ArrivalVar = v
-
-	// Strictly Physical Capacity
+	// 1. Hardware State
 	cap := p.capacityNext(x)
-	service := x.ServiceRate * cap
+	
+	// 2. Jackson Network: Downstream topology degradation
+	effectiveServiceRate := x.ServiceRate * (1.0 - x.UpstreamPressure)
+	totalPhysicalCapacity := cap * effectiveServiceRate
 
-	// Physical Flow Equation (Mass Balance)
-	// Accumulation (dQ) = Flow In (Arrival + Retries + Noise) - Flow Out (Service Capacity)
-	flowIn := next.ArrivalMean + p.retryCascade(x) + x.Disturbance
-	flowOut := service
+	// 3. Fluid Queuing: Total Flow In = Base + Retries
+	flowIn := x.ArrivalMean + x.RetryFactor + x.Disturbance
+	flowOut := totalPhysicalCapacity
 
+	// 4. Differential Accumulation
 	dQ := (flowIn - flowOut) * p.Dt
 
-	next.Backlog = p.overloadBarrier(x.Backlog + dQ)
+	next.Backlog = x.Backlog + dQ
 	if next.Backlog < 0 {
-		next.Backlog = 0.0 // True physical floor (can't have negative requests)
+		next.Backlog = 0.0 // True physical floor constraint
 	}
 
 	next.CapacityActive = cap
 	next.Latency = p.latencyNext(x)
-	
-	dist, energy := p.disturbanceNext(x)
-	next.Disturbance = dist
-	next.DisturbanceEnergy = energy
 
 	return next
 }

@@ -180,3 +180,27 @@ func (m *MPCOptimiser) Optimise(initial MPCState, prevSeq []MPCControl) ([]MPCCo
 	copy(result, m.seqBuf)
 	return result, conf
 }
+
+
+// 🧠 PRODUCTION UPGRADE: Dynamic MPC Calibration (Bryson's Rule & CBF Slack)
+func (mpc *MPCOptimiser) CalibrateConstraints(initialState MPCState) {
+	// 1. BRYSON'S RULE: Dynamic Cost Generation based on physical SLA boundaries
+	maxSafeQueue := initialState.ArrivalMean * (initialState.Latency / 1000.0) 
+	if maxSafeQueue < 1.0 { maxSafeQueue = 1.0 }
+
+	// Calculate a slack variable for Control Barrier Functions (CBF)
+	hardwareSlack := math.Max(2.0, initialState.CapacityActive * 0.20)
+	if initialState.Backlog > maxSafeQueue * 2.0 {
+		hardwareSlack += math.Max(5.0, initialState.CapacityActive * 0.50) // Emergency Slack
+	}
+
+	// Apply Bryson's Rule: Cost = 1 / (Max Deviation)^2
+	mpc.BacklogCost = (1.0 / math.Pow(maxSafeQueue, 2)) * 1000.0
+	mpc.LatencyCost = mpc.BacklogCost * 0.5
+	mpc.ScalingCost = (1.0 / math.Pow(hardwareSlack, 2)) * 1000.0
+	mpc.SmoothCost  = mpc.ScalingCost * 2.0
+
+	// 2. DYNAMIC ACTUATOR BOUNDS (Control Barrier Function)
+	mpc.MinCapacity = math.Max(1.0, initialState.CapacityActive * 0.5) 
+	mpc.MaxCapacity = math.Min(100.0, initialState.CapacityActive + hardwareSlack)
+}
